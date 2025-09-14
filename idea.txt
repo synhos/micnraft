@@ -1,0 +1,416 @@
+Mod: Friend Mesh (client-only Fabric)
+0) Goal & Non-Goals
+
+Goal: Let players who have the mod and are on the same server discover each other, keep a “friends” list, and exchange small messages/commands (e.g., “overlay text”, “make client jump”) that only run locally on consenting recipients.
+
+Non-Goals: No server hooks; no advantages that require server logic; no effects on non-modded players; nothing that bypasses server anti-cheat.
+
+1) Tech Targets
+
+Minecraft: 1.20.1 (adjust API names if you target another minor)
+
+Java: 17
+
+Fabric Loader: ≥ 0.15.x
+
+Fabric API: latest for your MC version
+
+Optional UI lib: Cloth Config (nice to have, not required)
+
+2) High-Level Architecture
+
+Transport: public chat messages (and optional fallback carriers like item rename text) that look harmless to the server but contain a small, encoded payload.
+
+Protocol: lightweight, prefix-tagged “frames” with versioning, minimal fragmentation, and optional authenticated encryption.
+
+Client commands (local only): /fm ... (never sent to the server).
+
+Consent gate: “Allow Trolling” OFF by default; per-friend allowlist for specific actions.
+
+Persistence: JSON config in .minecraft/config/friendmesh.json.
+
+3) UX Summary
+
+On join: your client announces itself (a tiny “HELLO” frame embedded in a normal chat line).
+
+Peers with mod: detect the HELLO, respond with ACK, derive a session key (optional secure mode).
+
+Friends tab: shows mod users on this server; lets you add/remove/rename, toggle per-friend permissions.
+
+Commands you can run (examples):
+
+/fm say <friend> <text> → shows an overlay/title on their screen.
+
+/fm jump <friend> → makes their client press jump once.
+
+/fm ping <friend> → tiny round-trip timestamp, latency shown in UI.
+
+Settings: “Allow Trolling (global)”, “Allow from friends only”, per-action toggles (Jump, Overlay, Ping), rate limits.
+
+4) Networking & Protocol (Works on any server)
+4.1 Transport wrapper (chat)
+
+Every outbound frame becomes a harmless chat line:
+
+[MIDDLE DOT][SPACE]MFM1:<base64url_no_pad(payload)>
+
+
+Prefix token: · MFM1: (middle-dot + space, then a short marker)
+Rationale: human-ignorable, ASCII-safe, survives most chat filters.
+
+Payload: small JSON, base64url (no padding). Keep total line length < 200 chars.
+
+4.2 Frame types (JSON)
+// Common fields across frames
+{
+  "v": 1,                 // protocol version
+  "t": "HELLO|ACK|CMD|FRAG|PING",
+  "sid": "short-session-id",   // random 6–8 chars per-join
+  "from": "<senderUUID-unsignedLowerHex12>", // last 12 hex of UUID to shrink size
+  "ts": 1723542012345     // ms epoch
+}
+
+HELLO
+{
+  "t":"HELLO",
+  "name":"PlayerName",
+  "pk":"<base64url X25519 public key>", // optional: secure mode only
+  "mods":[["fm", "1.0.0"]]
+}
+
+ACK
+{
+  "t":"ACK",
+  "to":"<senderShortUUID>",
+  "pk":"<base64url X25519 public key>", // optional: secure mode
+  "echo":"<sender.sid>"
+}
+
+CMD (encrypted if secure mode ON)
+{
+  "t":"CMD",
+  "to":"<targetShortUUID>",
+  "act":"JUMP|SAY|PING",
+  "args":{"text":"Hello"},  // act-specific
+  "nonce":"<12b hex>",      // for AEAD if encrypted
+  "mac":"<16b base64url>"   // if not using AEAD, HMAC over canonical JSON
+}
+
+PING
+{
+  "t":"PING",
+  "to":"<targetShortUUID>",
+  "seq": 17
+}
+
+FRAG (rarely needed)
+{
+  "t":"FRAG",
+  "id":"<fragId>",
+  "n": 3,     // total fragments
+  "i": 1,     // index
+  "d":"<base64url partial payload>"
+}
+
+4.3 Security modes
+
+Simple mode (default): no crypto, include from, sid, and to; recipients only accept if:
+
+“Allow Trolling” is ON and
+
+Sender is in friends list (if “friends-only” enabled).
+
+Secure mode (recommended): X25519 ECDH using HELLO/ACK exchange → derive K = HKDF(shared, salt=sorted two UUIDs, info="MFM1"), then encrypt CMD with AES-GCM.
+Java ≥11 has X25519 & AES-GCM in standard libs.
+
+4.4 Rate limits
+
+Outbound frames: max 1/500ms, burst 3; back off on server mute.
+
+Per-sender action limits on recipient: e.g., JUMP ≤ 1/2s, SAY overlay ≤ 1/3s.
+
+5) Consent & Safety Rules (hard requirements)
+
+“Allow Trolling” default OFF.
+
+If OFF: ignore all incoming CMD.
+
+If ON: apply per-friend & per-action toggles.
+
+Never send gameplay-breaking inputs (no movement spam, no click injection, no inventory spam).
+
+Only simulate one jump per JUMP.
+
+Don’t auto-reconnect or bypass mutes/filters.
+
+6) Client Commands (local, Brigadier via Fabric)
+
+/fm on|off — global allow trolling.
+
+/fm friends — open Friends UI.
+
+/fm allow <name> <action> — allow action for friend.
+
+/fm deny <name> <action>
+
+/fm say <name> <text...> — send overlay text.
+
+/fm jump <name>
+
+/fm ping <name>
+
+/fm mode secure|simple — toggle crypto.
+
+/fm status — show peers, key status, rate limits.
+
+Use Fabric’s client command registration so these never reach the server.
+
+7) UI Spec
+
+HUD indicator: small dot “FM” when at least one peer is detected (green = secure, gray = simple).
+
+Friends Screen:
+
+Tabs: Peers (session), Friends (saved), Settings.
+
+Peers: list of currently seen mod users with Add Friend button.
+
+Friends: rename, remove, per-action toggles (Jump, Say, Ping).
+
+Settings: global allow toggle, friends-only toggle, secure/simple mode, rate limits.
+
+Overlay renderer: for SAY action: centered title/subtitle style with 2–3s timeout.
+
+8) Persistence (JSON)
+
+~/.minecraft/config/friendmesh.json
+
+{
+  "version": 1,
+  "globalAllow": false,
+  "friendsOnly": true,
+  "mode": "secure",
+  "rate": { "outMs": 500, "jumpMinMs": 2000, "sayMinMs": 3000 },
+  "friends": [
+    {
+      "uuid": "12345678abcd1234abcd12345678abcd",
+      "name": "Alex",
+      "actions": { "JUMP": true, "SAY": true, "PING": true }
+    }
+  ]
+}
+
+9) Lifecycle & State Machine
+
+Client joins server
+
+Create sid, generate ephemeral X25519 keypair (if secure mode).
+
+Send HELLO frame (wrapped in chat line).
+
+On receiving HELLO
+
+Add to Peers (session list).
+
+If secure mode: send ACK with our public key & echo sid.
+
+On receiving ACK
+
+If echo matches our sid, compute shared secret; set peer.secure=true.
+
+Commands
+
+Sender runs /fm jump Alex: look up friend’s short UUID → send CMD.
+
+Recipient validates consent/rate → execute local action.
+
+Timeouts
+
+Peer entries expire after 2 minutes of inactivity.
+
+Keys expire on world/server leave.
+
+10) Actions (initial set)
+
+JUMP: call client.player.jump() (or set keybinding pressed once). Guard with cooldown.
+
+SAY: show overlay/title: CLIENT.titleManager().setTitle(text, 60 ticks). No server packet.
+
+PING: recipient auto-replies with CMD act=PING including seq; sender measures RTT.
+
+11) Implementation Steps (do these in order)
+Step 1 — Project scaffold
+
+Use Fabric Loom template.
+
+Add Fabric API dependency.
+
+Create fabric.mod.json with mod id friendmesh.
+
+Step 2 — Config & storage
+
+Implement ConfigService:
+
+Load/save JSON.
+
+Accessors: isGlobalAllow(), isFriend(uuid), isActionAllowed(uuid, act), rate getters.
+
+Step 3 — Peer/session model
+
+Peer fields: uuidShort, name, secure, lastSeen, publicKey, sessionK.
+
+PeerRegistry: add/update by uuidShort; prune by timeout.
+
+Step 4 — Codec & transport
+
+Frame POJOs; FrameCodec to (de)serialize & base64url encode.
+
+Transport:
+
+sendFrame(Frame f) → build JSON → base64url → prepend · MFM1: → call sendChatMessage.
+
+onChatReceived(String line) → if startsWith prefix, decode and dispatch.
+
+Step 5 — Secure mode (optional but recommended)
+
+Crypto:
+
+X25519 keypair on join.
+
+deriveKey(peerPub) → HKDF → 128-bit AES-GCM key.
+
+encryptCMD/decryptCMD.
+
+Fallback cleanly to simple if crypto fails or public key is absent.
+
+Step 6 — Handshake
+
+On join: send HELLO.
+
+On HELLO: store peer; send ACK (if secure).
+
+On ACK: verify echo==ourSid → derive key → mark secure=true.
+
+Step 7 — Client commands
+
+Register via Fabric’s client command API:
+
+/fm ... handlers call CommandService which:
+
+Resolves friend name → uuidShort.
+
+Builds CMD frame.
+
+Calls Transport.sendFrame.
+
+Step 8 — Consent gate & rate limiting
+
+InboundGuard:
+
+Reject if !config.globalAllow.
+
+If friendsOnly, require friend match.
+
+Check per-action allowed for that friend.
+
+Enforce cooldowns with Map<(sender,act), lastTime>.
+
+Step 9 — Action executors
+
+ActionExecutor routes JUMP/SAY/PING:
+
+JUMP: one jump; ignore if in GUI or no player.
+
+SAY: render overlay/title for 2–3s.
+
+PING: if to==me, reply; else show RTT in UI.
+
+Step 10 — UI
+
+Simple screen using vanilla widgets:
+
+FriendsScreen (Peers, Friends, Settings).
+
+Hook keybinding to open (e.g., default J).
+
+HUD badge “FM” with tooltip on hover (secure/simple, peers count).
+
+Step 11 — Edge handling
+
+Don’t read/emit frames while in singleplayer (unless LAN).
+
+If server muting/filtering detected (your lines not echoed): slow down announces.
+
+Ignore frames with ts too far in future/past (>30s skew).
+
+Step 12 — Tests
+
+Two local clients on a LAN world or test server.
+
+Verify:
+
+Peer discovery (HELLO/ACK).
+
+Secure mode key derivation.
+
+Consent toggles block/allow.
+
+Rate limits (can’t spam jump).
+
+Works on Paper/Velocity (chat line passes through).
+
+Long player names & Unicode don’t break base64url boundary.
+
+12) Minimal Class Sketch (names can vary)
+
+FriendMeshMod (init, events)
+
+ConfigService
+
+Peer, PeerRegistry
+
+Frame (+ subclasses HelloFrame, AckFrame, CmdFrame, FragFrame)
+
+FrameCodec
+
+Transport (send/receive chat)
+
+Crypto (X25519, HKDF, AES-GCM)
+
+InboundGuard
+
+ActionExecutor
+
+CommandService (/fm)
+
+FriendsScreen, HudIndicator
+
+13) Carrier Fallbacks (if chat filtered)
+
+Optional extra channels that still look normal:
+
+Book title/item rename: send a tiny rename with payload marker, then change back. (Do sparingly; respect anti-spam.)
+
+Tell/whisper: if server allows /tell, payload via DM to target (reduces broadcast noise).
+
+14) Practical Limits & Notes
+
+Keep each line short; aim payload ≤ 120 chars pre-base64.
+
+Prefer one frame per second during idle (heartbeat/presence) or don’t heartbeat at all—just HELLO on join and on tab-list changes.
+
+Never simulate anything but one jump per command.
+
+Overlay text only; no chat injection to others.
+
+15) What the other AI should output
+
+A Fabric project with the classes above.
+
+fabric.mod.json, Gradle build (Java 17).
+
+Config file auto-created with defaults.
+
+Working /fm client commands, UI, and chat-framed protocol.
+
+README stating “client-only, consent-gated, no server plugin required.”
